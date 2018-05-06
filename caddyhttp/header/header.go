@@ -22,6 +22,8 @@ import (
 	"strings"
 
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 // Headers is middleware that adds headers to the responses
@@ -34,6 +36,10 @@ type Headers struct {
 // ServeHTTP implements the httpserver.Handler interface and serves requests,
 // setting headers on the response according to the configured rules.
 func (h Headers) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/header.(Headers).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	replacer := httpserver.NewReplacer(r, nil, "")
 	rww := &responseWriterWrapper{
 		ResponseWriterWrapper: &httpserver.ResponseWriterWrapper{ResponseWriter: w},

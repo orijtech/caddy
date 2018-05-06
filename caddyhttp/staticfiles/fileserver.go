@@ -29,6 +29,8 @@ import (
 	"strings"
 
 	"github.com/mholt/caddy"
+
+	"go.opencensus.io/trace"
 )
 
 // FileServer implements a production-ready file server
@@ -53,41 +55,77 @@ type FileServer struct {
 
 // ServeHTTP serves static files for r according to fs's configuration.
 func (fs FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/fileserver.(FileServer).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	return fs.serveFile(w, r)
 }
 
 // serveFile writes the specified file to the HTTP response.
 // name is '/'-separated, not filepath.Separator.
 func (fs FileServer) serveFile(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/fileserver.(FileServer).serveFile")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	reqPath := r.URL.Path
 
 	// Prevent absolute path access on Windows.
 	// TODO remove when stdlib http.Dir fixes this.
 	if runtime.GOOS == "windows" && len(reqPath) > 0 && filepath.IsAbs(reqPath[1:]) {
+		span.SetStatus(trace.Status{
+			Code:    int32(trace.StatusCodeNotFound),
+			Message: "On Windows yet requesting absolute path access",
+		})
 		return http.StatusNotFound, nil
 	}
 
+	_, fOpenSpan := trace.StartSpan(ctx, "fs.Root.Open")
 	// open the requested file
 	f, err := fs.Root.Open(reqPath)
+	fOpenSpan.End()
 	if err != nil {
 		if os.IsNotExist(err) {
+			span.SetStatus(trace.Status{
+				Code:    int32(trace.StatusCodeNotFound),
+				Message: "File not found",
+			})
 			return http.StatusNotFound, nil
 		} else if os.IsPermission(err) {
+			span.SetStatus(trace.Status{
+				Code:    int32(trace.StatusCodePermissionDenied),
+				Message: "No access to the file",
+			})
 			return http.StatusForbidden, err
 		}
 		// otherwise, maybe the server is under load and ran out of file descriptors?
 		backoff := int(3 + rand.Int31()%3) // 3–5 seconds to prevent a stampede
 		w.Header().Set("Retry-After", strconv.Itoa(backoff))
+		span.SetStatus(trace.Status{
+			Code:    int32(trace.StatusCodeUnavailable),
+			Message: err.Error(),
+		})
 		return http.StatusServiceUnavailable, err
 	}
 	defer f.Close()
 
 	// get information about the file
+	_, fStatSpan := trace.StartSpan(ctx, "file.Stat")
 	d, err := f.Stat()
+	fStatSpan.End()
 	if err != nil {
 		if os.IsNotExist(err) {
+			span.SetStatus(trace.Status{
+				Code:    int32(trace.StatusCodeNotFound),
+				Message: err.Error(),
+			})
 			return http.StatusNotFound, nil
 		} else if os.IsPermission(err) {
+			span.SetStatus(trace.Status{
+				Code:    int32(trace.StatusCodePermissionDenied),
+				Message: err.Error(),
+			})
 			return http.StatusForbidden, err
 		}
 		// return a different status code than above to distinguish these cases
@@ -96,6 +134,9 @@ func (fs FileServer) serveFile(w http.ResponseWriter, r *http.Request) (int, err
 
 	// redirect to canonical path (being careful to preserve other parts of URL and
 	// considering cases where a site is defined with a path prefix that gets stripped)
+	_, canonicalRedirectSpan := trace.StartSpan(ctx, "canonicalRedirect")
+	defer canonicalRedirectSpan.End()
+
 	urlCopy := *r.URL
 	pathPrefix, _ := r.Context().Value(caddy.CtxKey("path_prefix")).(string)
 	if pathPrefix != "/" {
@@ -178,6 +219,10 @@ func (fs FileServer) serveFile(w http.ResponseWriter, r *http.Request) (int, err
 	// return Not Found if we either did not find an index file (and thus are
 	// still a directory) or if this file is supposed to be hidden
 	if d.IsDir() || fs.IsHidden(d) {
+		span.SetStatus(trace.Status{
+			Code:    int32(trace.StatusCodeNotFound),
+			Message: "isDir or supposed to be hidden",
+		})
 		return http.StatusNotFound, nil
 	}
 
@@ -201,12 +246,16 @@ func (fs FileServer) serveFile(w http.ResponseWriter, r *http.Request) (int, err
 		}
 
 		// see if the compressed version of this file exists
+		_, fEncodedSpan := trace.StartSpan(ctx, "fs.Root.Open")
 		encodedFile, err := fs.Root.Open(reqPath + staticEncoding[encoding])
+		fEncodedSpan.End()
 		if err != nil {
 			continue
 		}
 
+		_, fEncodedStatSpan := trace.StartSpan(ctx, "encodedFile.Stat")
 		encodedFileInfo, err := encodedFile.Stat()
+		fEncodedStatSpan.End()
 		if err != nil {
 			encodedFile.Close()
 			continue

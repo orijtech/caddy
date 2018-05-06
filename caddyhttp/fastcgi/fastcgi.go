@@ -38,6 +38,8 @@ import (
 	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
 	"github.com/mholt/caddy/caddytls"
+
+	"go.opencensus.io/trace"
 )
 
 // Handler is a middleware type that can handle requests as a FastCGI client.
@@ -56,6 +58,15 @@ type Handler struct {
 
 // ServeHTTP satisfies the httpserver.Handler interface.
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/fastcgi.(Handler).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+	if len(h.Rules) > 0 {
+		span.Annotate([]trace.Attribute{
+			trace.Int64Attribute("n_rules", int64(len(h.Rules))),
+		}, "Applying rules")
+	}
+
 	for _, rule := range h.Rules {
 		// First requirement: Base path must match request path. If it doesn't,
 		// we check to make sure the leading slash is not missing, and if so,

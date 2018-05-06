@@ -37,6 +37,9 @@ import (
 	"github.com/mholt/caddy/caddyhttp/staticfiles"
 	"github.com/mholt/caddy/caddytls"
 	"github.com/mholt/caddy/telemetry"
+
+	"go.opencensus.io/plugin/ochttp"
+	"go.opencensus.io/trace"
 )
 
 // Server is the HTTP server implementation.
@@ -338,8 +341,24 @@ func (s *Server) ServePacket(pc net.PacketConn) error {
 	return nil
 }
 
+func caller() string {
+	pc, file, line, _ := runtime.Caller(3)
+	fn := runtime.FuncForPC(pc)
+	return fmt.Sprintf("%s::%s %d", file, fn.Name(), line)
+}
+
 // ServeHTTP is the entry point of all HTTP requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h := &ochttp.Handler{Handler: sServer{Server: s}}
+	h.ServeHTTP(w, r)
+}
+
+type sServer struct {
+	*Server
+}
+
+func (ss sServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s := ss.Server
 	defer func() {
 		// We absolutely need to be sure we stay alive up here,
 		// even though, in theory, the errors middleware does this.
@@ -359,6 +378,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go telemetry.AppendUnique("http_user_agent_count", uaHash)
 	go telemetry.Increment("http_request_count")
 
+	// TODO: Perhaps use a fresh context.Context instead of r.Context()?
+	// This is because Caddy is mostly the frontend service hence we don't
+	// want clients to trigger whether/when we trace or not.
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/httpserver.(*Server).ServeHTTP")
+	defer span.End()
+
 	// copy the original, unchanged URL into the context
 	// so it can be referenced by middlewares
 	urlCopy := *r.URL
@@ -367,7 +392,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		*userInfo = *r.URL.User
 		urlCopy.User = userInfo
 	}
-	c := context.WithValue(r.Context(), OriginalURLCtxKey, urlCopy)
+	c := context.WithValue(ctx, OriginalURLCtxKey, urlCopy)
 	r = r.WithContext(c)
 
 	// Setup a replacer for the request that keeps track of placeholder

@@ -42,6 +42,9 @@ import (
 	"github.com/lucas-clemente/quic-go"
 	"github.com/lucas-clemente/quic-go/h2quic"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/plugin/ochttp"
+	"go.opencensus.io/trace"
 )
 
 var (
@@ -309,6 +312,10 @@ func (rp *ReverseProxy) UseInsecureTransport() {
 // ServeHTTP serves the proxied request to the upstream by performing a roundtrip.
 // It is designed to handle websocket connection upgrades as well.
 func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, respUpdateFn respUpdateFn) error {
+	ctx, span := trace.StartSpan(outreq.Context(), "caddyhttp.(*ReverseProxy).ServeHTTP")
+	defer span.End()
+	outreq = outreq.WithContext(ctx)
+
 	transport := rp.Transport
 	if requestIsWebsocket(outreq) {
 		transport = newConnHijackerTransport(transport)
@@ -320,8 +327,12 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 		outreq.URL.Scheme = "https" // Change scheme back to https for QUIC RoundTripper
 	}
 
-	res, err := transport.RoundTrip(outreq)
+	ocTransport := &ochttp.Transport{Base: transport}
+	span.Annotate(nil, "Beginning RoundTrip")
+	res, err := ocTransport.RoundTrip(outreq)
+	span.Annotate(nil, "Completed RoundTrip")
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 		return err
 	}
 
@@ -330,6 +341,7 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 	// Remove hop-by-hop headers listed in the
 	// "Connection" header of the response.
 	if c := res.Header.Get("Connection"); c != "" {
+		span.Annotate(nil, "Removing hop-by-hop headers in Connection header")
 		for _, f := range strings.Split(c, ",") {
 			if f = strings.TrimSpace(f); f != "" {
 				res.Header.Del(f)
@@ -346,6 +358,9 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 	}
 
 	if isWebsocket {
+		span.Annotate([]trace.Attribute{
+			trace.BoolAttribute("is_websocket", true),
+		}, "Hijacking response")
 		defer res.Body.Close()
 		hj, ok := rw.(http.Hijacker)
 		if !ok {

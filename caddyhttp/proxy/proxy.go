@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 // Proxy represents a middleware instance that can proxy requests.
@@ -113,9 +115,14 @@ func (uh *UpstreamHost) Available() bool {
 
 // ServeHTTP satisfies the httpserver.Handler interface.
 func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/proxy.(Proxy).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	// start by selecting most specific matching upstream config
 	upstream := p.match(r)
 	if upstream == nil {
+		span.Annotate(nil, "Failed to find matching upstream config")
 		return p.Next.ServeHTTP(w, r)
 	}
 
@@ -167,11 +174,13 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 	}
 
 	var backendErr error
+	tries := int64(0)
 	for {
 		// since Select() should give us "up" hosts, keep retrying
 		// hosts until timeout (or until we get a nil host).
 		host := upstream.Select(r)
 		if host == nil {
+			span.Annotate(nil, "Failed to select upstream host")
 			if backendErr == nil {
 				backendErr = errors.New("no hosts available upstream")
 			}
@@ -180,6 +189,7 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 			}
 			continue
 		}
+		span.Annotate(nil, "Selected an upstream host")
 		if rr, ok := w.(*httpserver.ResponseRecorder); ok && rr.Replacer != nil {
 			rr.Replacer.Set("upstream", host.Name)
 		}
@@ -191,6 +201,7 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 		if nameURL, err := url.Parse(host.Name); err == nil {
 			outreq.Host = nameURL.Host
 			if proxy == nil {
+				span.Annotate(nil, "Creating a NewSingleHostReverseProxy")
 				proxy = NewSingleHostReverseProxy(nameURL,
 					host.WithoutPathPrefix,
 					http.DefaultMaxIdleConnsPerHost,
@@ -200,6 +211,9 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 
 			// use upstream credentials by default
 			if outreq.Header.Get("Authorization") == "" && nameURL.User != nil {
+				// Please only annotate event description but no
+				// credentials lest this becomes a security breach.
+				span.Annotate(nil, "Using upstream credentials")
 				pwd, _ := nameURL.User.Password()
 				outreq.SetBasicAuth(nameURL.User.Username(), pwd)
 			}
@@ -252,6 +266,10 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 		}
 
 		if backendErr == httpserver.ErrMaxBytesExceeded {
+			span.SetStatus(trace.Status{
+				Code:    int32(trace.StatusCodeOutOfRange),
+				Message: backendErr.Error(),
+			})
 			return http.StatusRequestEntityTooLarge, backendErr
 		}
 
@@ -268,10 +286,22 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 
 		// if we've tried long enough, break
 		if !keepRetrying(backendErr) {
+			span.Annotate([]trace.Attribute{
+				trace.Int64Attribute("try", tries),
+			}, "No longer trying to make request")
 			break
 		}
+
+		tries += 1
+		span.Annotate([]trace.Attribute{
+			trace.Int64Attribute("try", tries),
+		}, "Try again")
 	}
 
+	span.SetStatus(trace.Status{
+		Code:    trace.StatusCodeInternal,
+		Message: "Failed to make request",
+	})
 	return http.StatusBadGateway, backendErr
 }
 
@@ -299,7 +329,10 @@ func (p Proxy) match(r *http.Request) Upstream {
 func createUpstreamRequest(rw http.ResponseWriter, r *http.Request) (*http.Request, context.CancelFunc) {
 	// Original incoming server request may be canceled by the
 	// user or by std lib(e.g. too many idle connections).
-	ctx, cancel := context.WithCancel(r.Context())
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/proxy.createUpstreamRequest")
+	defer span.End()
+
+	ctx, cancel := context.WithCancel(ctx)
 	if cn, ok := rw.(http.CloseNotifier); ok {
 		notifyChan := cn.CloseNotify()
 		go func() {
@@ -361,6 +394,7 @@ func createUpstreamRequest(rw http.ResponseWriter, r *http.Request) (*http.Reque
 		}
 		outreq.Header.Set("X-Forwarded-For", clientIP)
 	}
+	outreq = outreq.WithContext(ctx)
 
 	return outreq, cancel
 }

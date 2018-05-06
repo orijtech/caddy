@@ -23,6 +23,8 @@ import (
 
 	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 func init() {
@@ -55,6 +57,17 @@ func (g Gzip) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		return g.Next.ServeHTTP(w, r)
 	}
+
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/gzip.(Gzip).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
+	if len(g.Configs) > 0 {
+		span.Annotate([]trace.Attribute{
+			trace.Int64Attribute("n_configs", int64(len(g.Configs))),
+		}, "Using configurations")
+	}
+
 outer:
 	for _, c := range g.Configs {
 

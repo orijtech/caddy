@@ -29,10 +29,16 @@ import (
 	"time"
 
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 // ServeHTTP implements the httpserver.Handler interface.
 func (t Templates) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	startCtx, span := trace.StartSpan(r.Context(), "caddyhttp/templates.(Templates).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(startCtx)
+
 	// iterate rules, to find first one that matches the request path
 	for _, rule := range t.Rules {
 		if !httpserver.Path(r.URL.Path).Matches(rule.Path) {
@@ -86,8 +92,14 @@ func (t Templates) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 		tpl.Funcs(httpserver.TemplateFuncs)
 
 		// parse the template
+		_, parseTmplSpan := trace.StartSpan(startCtx, "parseTemplate")
 		parsedTpl, err := tpl.Parse(rb.Buffer.String())
+		parseTmplSpan.End()
 		if err != nil {
+			span.SetStatus(trace.Status{
+				Code:    int32(trace.StatusCodeInternal),
+				Message: err.Error(),
+			})
 			return http.StatusInternalServerError, err
 		}
 
@@ -99,8 +111,14 @@ func (t Templates) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 
 		// execute the template
 		buf.Reset()
+		_, execTmplSpan := trace.StartSpan(startCtx, "executeParsedTemplate")
 		err = parsedTpl.Execute(buf, ctx)
+		execTmplSpan.End()
 		if err != nil {
+			span.SetStatus(trace.Status{
+				Code:    int32(trace.StatusCodeInternal),
+				Message: err.Error(),
+			})
 			return http.StatusInternalServerError, err
 		}
 
@@ -115,7 +133,9 @@ func (t Templates) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 
 		// at last, write the rendered template to the response; make sure to use
 		// use the proper status code, since ServeContent hard-codes 2xx codes...
+		_, serveSpan := trace.StartSpan(startCtx, "ServeContent")
 		http.ServeContent(rb.StatusCodeWriter(w), r, templateName, modTime, bytes.NewReader(buf.Bytes()))
+		serveSpan.End()
 
 		return 0, nil
 	}
