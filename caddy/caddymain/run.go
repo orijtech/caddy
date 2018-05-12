@@ -74,7 +74,6 @@ func init() {
 
 	caddy.RegisterCaddyfileLoader("flag", caddy.LoaderFunc(confLoader))
 	caddy.SetDefaultCaddyfileLoader("default", caddy.LoaderFunc(defaultLoader))
-	createOpenCensusExporters(traceSamplerRate, prometheusPort)
 }
 
 // Run is Caddy's main() function.
@@ -84,6 +83,8 @@ func Run() {
 	caddy.AppName = appName
 	caddy.AppVersion = appVersion
 	acme.UserAgent = appName + "/" + appVersion
+
+	createOpenCensusExporters(traceSamplerRate, prometheusPort)
 
 	// Set up process log before anything bad happens
 	switch logfile {
@@ -455,31 +456,30 @@ func createOpenCensusExporters(sampleRate float64, prometheusPort int) {
 	var defaultSampler trace.Sampler
 	switch {
 	case sampleRate <= 0.0:
+		fmt.Printf("Never sampling!\n")
 		defaultSampler = trace.NeverSample()
 	case sampleRate >= 1.0:
+		fmt.Printf("Always sampling!\n")
 		defaultSampler = trace.AlwaysSample()
 	default:
+		fmt.Printf("Probability sampler: %.4f\n", sampleRate)
 		defaultSampler = trace.ProbabilitySampler(sampleRate)
 	}
 	trace.ApplyConfig(trace.Config{DefaultSampler: defaultSampler})
 
-	if prometheusPort > 0 {
-		pe, err := prometheus.NewExporter(prometheus.Options{
-			Namespace: "caddyserver",
-		})
-		if err != nil {
-			log.Fatalf("Failed to create Prometheus exporter: %v", err)
-		}
-		view.RegisterExporter(pe)
-		go func() {
-			mux := http.NewServeMux()
-			mux.Handle("/metrics", pe)
-			addr := fmt.Sprintf(":%d", prometheusPort)
-			if err := http.ListenAndServe(addr, mux); err != nil {
-				log.Fatalf("Failed to server Prometheus endpoint: %v", err)
-			}
-		}()
+	if err := view.Register(ochttp.DefaultServerViews...); err != nil {
+		log.Fatalf("Failed to register ochttp.DefaultServerViews: %v", err)
 	}
+	if err := view.Register(ochttp.DefaultClientViews...); err != nil {
+		log.Fatalf("Failed to register ochttp.DefaultClientViews: %v", err)
+	}
+
+	// Collecting runtime stats
+	rmc := new(runtimeMetrics)
+	if err := view.Register(memStatsViews...); err != nil {
+		log.Fatalf("Failed to register memory statistics views: %v", err)
+	}
+	go rmc.cycle(nil)
 
 	xe, err := xray.NewExporter(xray.WithVersion("latest"))
 	if err != nil {
@@ -497,10 +497,22 @@ func createOpenCensusExporters(sampleRate float64, prometheusPort int) {
 	trace.RegisterExporter(se)
 	view.RegisterExporter(se)
 
-	if err := view.Register(ochttp.DefaultServerViews...); err != nil {
-		log.Fatalf("Failed to register ochttp.DefaultServerViews: %v", err)
+	if prometheusPort > 0 {
+		pe, err := prometheus.NewExporter(prometheus.Options{
+			Namespace: "caddyserver",
+		})
+		if err != nil {
+			log.Fatalf("Failed to create Prometheus exporter: %v", err)
+		}
+		view.RegisterExporter(pe)
+		go func() {
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", pe)
+			addr := fmt.Sprintf(":%d", prometheusPort)
+			if err := http.ListenAndServe(addr, mux); err != nil {
+				log.Fatalf("Failed to serve Prometheus endpoint: %v", err)
+			}
+		}()
 	}
-	if err := view.Register(ochttp.DefaultClientViews...); err != nil {
-		log.Fatalf("Failed to register ochttp.DefaultClientViews: %v", err)
-	}
+
 }

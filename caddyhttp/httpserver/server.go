@@ -341,15 +341,9 @@ func (s *Server) ServePacket(pc net.PacketConn) error {
 	return nil
 }
 
-func caller() string {
-	pc, file, line, _ := runtime.Caller(3)
-	fn := runtime.FuncForPC(pc)
-	return fmt.Sprintf("%s::%s %d", file, fn.Name(), line)
-}
-
 // ServeHTTP is the entry point of all HTTP requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h := &ochttp.Handler{Handler: sServer{Server: s}}
+	h := &ochttp.Handler{Handler: sServer{Server: s}, IsPublicEndpoint: true}
 	h.ServeHTTP(w, r)
 }
 
