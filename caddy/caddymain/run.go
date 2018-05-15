@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -38,14 +37,6 @@ import (
 
 	_ "github.com/mholt/caddy/caddyhttp" // plug in the HTTP server type
 	// This is where other plugins get plugged in (imported)
-
-	// Distributed tracing and monitoring imports
-	xray "github.com/census-instrumentation/opencensus-go-exporter-aws"
-	"go.opencensus.io/exporter/prometheus"
-	"go.opencensus.io/exporter/stackdriver"
-	"go.opencensus.io/plugin/ochttp"
-	"go.opencensus.io/stats/view"
-	"go.opencensus.io/trace"
 )
 
 func init() {
@@ -69,7 +60,7 @@ func init() {
 	flag.StringVar(&serverType, "type", "http", "Type of server to run")
 	flag.BoolVar(&version, "version", false, "Show version")
 	flag.BoolVar(&validate, "validate", false, "Parse the Caddyfile but do not start the server")
-	flag.Float64Var(&traceSamplerRate, "trace-sampler-rate", 0.001, "If set to > 0 signifies the trace sampling probability\n\te.g 0.1 to trace 1 in 10 requests.\n\tDefault is 1 in 1000 or 0.001")
+	flag.Float64Var(&traceSamplerRate, "trace-sampler-rate", 0.0, "If set to > 0 signifies the trace sampling probability\n\te.g 0.01 to trace 1 in 100 requests.\n\tIt is off by default")
 	flag.IntVar(&prometheusPort, "prometheus-port", 0, "If set to anything but 0, signifies the port on which to run the prometheus exporter")
 
 	caddy.RegisterCaddyfileLoader("flag", caddy.LoaderFunc(confLoader))
@@ -451,68 +442,3 @@ var (
 )
 
 const enableTelemetry = true
-
-func createOpenCensusExporters(sampleRate float64, prometheusPort int) {
-	var defaultSampler trace.Sampler
-	switch {
-	case sampleRate <= 0.0:
-		fmt.Printf("Never sampling!\n")
-		defaultSampler = trace.NeverSample()
-	case sampleRate >= 1.0:
-		fmt.Printf("Always sampling!\n")
-		defaultSampler = trace.AlwaysSample()
-	default:
-		fmt.Printf("Probability sampler: %.4f\n", sampleRate)
-		defaultSampler = trace.ProbabilitySampler(sampleRate)
-	}
-	trace.ApplyConfig(trace.Config{DefaultSampler: defaultSampler})
-
-	if err := view.Register(ochttp.DefaultServerViews...); err != nil {
-		log.Fatalf("Failed to register ochttp.DefaultServerViews: %v", err)
-	}
-	if err := view.Register(ochttp.DefaultClientViews...); err != nil {
-		log.Fatalf("Failed to register ochttp.DefaultClientViews: %v", err)
-	}
-
-	// Collecting runtime stats
-	rmc := new(runtimeMetrics)
-	if err := view.Register(memStatsViews...); err != nil {
-		log.Fatalf("Failed to register memory statistics views: %v", err)
-	}
-	go rmc.cycle(nil)
-
-	xe, err := xray.NewExporter(xray.WithVersion("latest"))
-	if err != nil {
-		log.Fatalf("Failed to create AWS X-Ray exporter: %v", err)
-	}
-	trace.RegisterExporter(xe)
-
-	se, err := stackdriver.NewExporter(stackdriver.Options{
-		ProjectID:    "census-demos",
-		MetricPrefix: "caddyserver",
-	})
-	if err != nil {
-		log.Fatalf("Failed to create Stackdriver exporter: %v", err)
-	}
-	trace.RegisterExporter(se)
-	view.RegisterExporter(se)
-
-	if prometheusPort > 0 {
-		pe, err := prometheus.NewExporter(prometheus.Options{
-			Namespace: "caddyserver",
-		})
-		if err != nil {
-			log.Fatalf("Failed to create Prometheus exporter: %v", err)
-		}
-		view.RegisterExporter(pe)
-		go func() {
-			mux := http.NewServeMux()
-			mux.Handle("/metrics", pe)
-			addr := fmt.Sprintf(":%d", prometheusPort)
-			if err := http.ListenAndServe(addr, mux); err != nil {
-				log.Fatalf("Failed to serve Prometheus endpoint: %v", err)
-			}
-		}()
-	}
-
-}
