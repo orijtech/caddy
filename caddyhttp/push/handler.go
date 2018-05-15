@@ -19,18 +19,26 @@ import (
 	"strings"
 
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 func (h Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/push.(Middleware")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	pusher, hasPusher := w.(http.Pusher)
 
 	// no push possible, carry on
 	if !hasPusher {
+		span.Annotate(nil, "no push possible")
 		return h.Next.ServeHTTP(w, r)
 	}
 
 	// check if this is a request for the pushed resource (avoid recursion)
 	if _, exists := r.Header[pushHeader]; exists {
+		span.Annotate(nil, "request for the pushed resource")
 		return h.Next.ServeHTTP(w, r)
 	}
 

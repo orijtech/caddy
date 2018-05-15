@@ -22,6 +22,8 @@ import (
 
 	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 func init() {
@@ -39,6 +41,10 @@ type Logger struct {
 }
 
 func (l Logger) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/log.(Logger).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	for _, rule := range l.Rules {
 		if httpserver.Path(r.URL.Path).Matches(rule.PathScope) {
 			// Record the response

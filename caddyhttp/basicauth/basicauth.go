@@ -34,6 +34,8 @@ import (
 
 	"github.com/jimstudt/http-authentication/basic"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 // BasicAuth is middleware to protect resources with a username and password.
@@ -49,6 +51,10 @@ type BasicAuth struct {
 
 // ServeHTTP implements the httpserver.Handler interface.
 func (a BasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/basicauth.(BasicAuth).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	var protected, isAuthenticated bool
 	var realm string
 

@@ -19,6 +19,8 @@ import (
 	"net/http"
 
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 // Limit is a middleware to control request body size
@@ -28,7 +30,12 @@ type Limit struct {
 }
 
 func (l Limit) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/limits.(Limit).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	if r.Body == nil {
+		span.Annotate(nil, "Nil body")
 		return l.Next.ServeHTTP(w, r)
 	}
 

@@ -22,6 +22,8 @@ import (
 	"net/http"
 
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 // Redirect is middleware to respond with HTTP redirects
@@ -32,6 +34,10 @@ type Redirect struct {
 
 // ServeHTTP implements the httpserver.Handler interface.
 func (rd Redirect) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/redirect.(Redirect).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	for _, rule := range rd.Rules {
 		if (rule.FromPath == "/" || r.URL.Path == rule.FromPath) && schemeMatches(rule, r) && rule.Match(r) {
 			to := httpserver.NewReplacer(r, nil, "").Replace(rule.To)

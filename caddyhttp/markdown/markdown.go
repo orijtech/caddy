@@ -27,6 +27,8 @@ import (
 
 	"github.com/mholt/caddy/caddyhttp/httpserver"
 	"github.com/russross/blackfriday"
+
+	"go.opencensus.io/trace"
 )
 
 // Markdown implements a layer of middleware that serves
@@ -79,6 +81,10 @@ type cachedFileInfo struct {
 
 // ServeHTTP implements the http.Handler interface.
 func (md Markdown) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	rctx, span := trace.StartSpan(r.Context(), "caddyhttp/markdown.(Markdown).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(rctx)
+
 	var cfg *Config
 	for _, c := range md.Configs {
 		if httpserver.Path(r.URL.Path).Matches(c.PathScope) { // not negated
@@ -87,6 +93,7 @@ func (md Markdown) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 		}
 	}
 	if cfg == nil {
+		span.Annotate(nil, "No matching configuration found")
 		return md.Next.ServeHTTP(w, r) // exit early
 	}
 
@@ -94,6 +101,10 @@ func (md Markdown) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 	default:
+		span.Annotate([]trace.Attribute{
+			trace.StringAttribute("method", r.Method),
+		}, "Method not allowed")
+		span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: "Method not allowed"})
 		return http.StatusMethodNotAllowed, nil
 	}
 
@@ -109,10 +120,13 @@ func (md Markdown) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 		switch {
 		case err == nil: // nop
 		case os.IsPermission(err):
+			span.SetStatus(trace.Status{Code: int32(trace.StatusCodePermissionDenied), Message: err.Error()})
 			return http.StatusForbidden, err
 		case os.IsExist(err):
+			span.SetStatus(trace.Status{Code: int32(trace.StatusCodeNotFound), Message: err.Error()})
 			return http.StatusNotFound, nil
 		default: // did we run out of FD?
+			span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 			return http.StatusInternalServerError, err
 		}
 		defer fdp.Close()
@@ -133,11 +147,15 @@ func (md Markdown) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 
 	// If not supported extension, pass on it
 	if _, ok := cfg.Extensions[path.Ext(fpath)]; !ok {
+		span.Annotate(nil, "Unsupported extension")
 		return md.Next.ServeHTTP(w, r)
 	}
 
 	// At this point we have a supported extension/markdown
+	span.Annotate(nil, "Opening supported extension/markdown")
 	f, err := md.FileSys.Open(fpath)
+	span.Annotate(nil, "Finished opening supported extension/markdown")
+
 	switch {
 	case err == nil: // nop
 	case os.IsPermission(err):
@@ -151,6 +169,7 @@ func (md Markdown) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 
 	fs, err := f.Stat()
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 		return http.StatusGone, nil
 	}
 	lastModTime = latest(lastModTime, fs.ModTime())
@@ -161,6 +180,7 @@ func (md Markdown) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 	ctx.URL = r.URL
 	html, err := cfg.Markdown(title(fpath), f, dirents, ctx)
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 		return http.StatusInternalServerError, err
 	}
 

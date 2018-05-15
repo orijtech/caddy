@@ -19,6 +19,8 @@ import (
 	"net/http"
 
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 // Rule describes status rewriting rule
@@ -55,6 +57,10 @@ type Status struct {
 
 // ServeHTTP implements the httpserver.Handler interface
 func (status Status) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/status.(Status).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	if cfg := httpserver.ConfigSelector(status.Rules).Select(r); cfg != nil {
 		rule := cfg.(*Rule)
 

@@ -21,6 +21,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+
+	"go.opencensus.io/trace"
 )
 
 // Handler is a middleware handler
@@ -30,6 +32,10 @@ type Handler struct {
 }
 
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/requestid.(Handler).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	var reqid uuid.UUID
 
 	uuidFromHeader := r.Header.Get(h.HeaderName)

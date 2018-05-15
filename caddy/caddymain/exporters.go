@@ -53,7 +53,8 @@ var memStatsViews = []*view.View{
 	},
 }
 
-// do is a blocking routine that runs the
+// do is a blocking routine that periodically
+// runs the runtime metrics collector.
 func (rm *runtimeMetrics) cycle(cancel chan bool) {
 	var period time.Duration
 	if rm != nil {

@@ -32,6 +32,8 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
 	"github.com/mholt/caddy/caddyhttp/staticfiles"
+
+	"go.opencensus.io/trace"
 )
 
 const (
@@ -324,6 +326,10 @@ func isSymlinkTargetDir(f os.FileInfo, urlPath string, config *Config) bool {
 // ServeHTTP determines if the request is for this plugin, and if all prerequisites are met.
 // If so, control is handed over to ServeListing.
 func (b Browse) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/browse.(Browse).ServeHTTP")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	// See if there's a browse configuration to match the path
 	var bc *Config
 	for i := range b.Configs {
@@ -333,14 +339,20 @@ func (b Browse) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 		}
 	}
 	if bc == nil {
+		span.Annotate(nil, "Failed to find a browse configuration matching the path")
 		return b.Next.ServeHTTP(w, r)
 	}
 
+	span.Annotate(nil, "Found a browse configuration matching the path")
+
+	span.Annotate(nil, "Opening requestedFilepath")
 	// Browse works on existing directories; delegate everything else
 	requestedFilepath, err := bc.Fs.Root.Open(r.URL.Path)
+	span.Annotate(nil, "Completed opening requestedFilepath")
 	if err != nil {
 		switch {
 		case os.IsPermission(err):
+			span.SetStatus(trace.Status{Message: err.Error(), Code: int32(trace.StatusCodePermissionDenied)})
 			return http.StatusForbidden, err
 		case os.IsExist(err):
 			return http.StatusNotFound, err
@@ -452,6 +464,10 @@ func (b Browse) handleSortOrder(w http.ResponseWriter, r *http.Request, scope st
 
 // ServeListing returns a formatted view of 'requestedFilepath' contents'.
 func (b Browse) ServeListing(w http.ResponseWriter, r *http.Request, requestedFilepath http.File, bc *Config) (int, error) {
+	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/browse.(Browse).ServeListing")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	listing, containsIndex, err := b.loadDirectoryContents(requestedFilepath, r.URL.Path, bc)
 	if err != nil {
 		switch {

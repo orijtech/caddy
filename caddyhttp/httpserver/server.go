@@ -96,7 +96,10 @@ func NewServer(addr string, group []*SiteConfig) (*Server, error) {
 	}
 	s.vhosts.fallbackHosts = append(s.vhosts.fallbackHosts, getFallbacks(group)...)
 	s.Server = makeHTTPServerWithHeaderLimit(s.Server, group)
-	s.Server.Handler = s // this is weird, but whatever
+	s.Server.Handler = &ochttp.Handler{
+		Handler:          s, // this is weird, but whatever
+		IsPublicEndpoint: true,
+	}
 
 	// extract TLS settings from each site config to build
 	// a tls.Config, which will not be nil if TLS is enabled
@@ -343,16 +346,6 @@ func (s *Server) ServePacket(pc net.PacketConn) error {
 
 // ServeHTTP is the entry point of all HTTP requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h := &ochttp.Handler{Handler: sServer{Server: s}, IsPublicEndpoint: true}
-	h.ServeHTTP(w, r)
-}
-
-type sServer struct {
-	*Server
-}
-
-func (ss sServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s := ss.Server
 	defer func() {
 		// We absolutely need to be sure we stay alive up here,
 		// even though, in theory, the errors middleware does this.
@@ -377,6 +370,7 @@ func (ss sServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// want clients to trigger whether/when we trace or not.
 	ctx, span := trace.StartSpan(r.Context(), "caddyhttp/httpserver.(*Server).ServeHTTP")
 	defer span.End()
+	r = r.WithContext(ctx)
 
 	// copy the original, unchanged URL into the context
 	// so it can be referenced by middlewares
