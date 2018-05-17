@@ -39,6 +39,11 @@ func init() {
 // are specified by the user in the config file. All the automatic HTTPS
 // stuff comes later outside of this function.
 func setupTLS(c *caddy.Controller) error {
+	// Enable distributed monitoring elements/views
+	if err := enableDistributedMonitoring(); err != nil {
+		return err
+	}
+
 	// obtain the configGetter, which loads the config we're, uh, configuring
 	configGetter, ok := configGetters[c.ServerType()]
 	if !ok {

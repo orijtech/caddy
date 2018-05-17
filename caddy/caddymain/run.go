@@ -60,8 +60,8 @@ func init() {
 	flag.StringVar(&serverType, "type", "http", "Type of server to run")
 	flag.BoolVar(&version, "version", false, "Show version")
 	flag.BoolVar(&validate, "validate", false, "Parse the Caddyfile but do not start the server")
-	flag.Float64Var(&traceSamplerRate, "trace-sampler-rate", 0.0, "If set to > 0 signifies the trace sampling probability\n\te.g 0.01 to trace 1 in 100 requests.\n\tIt is off by default")
-	flag.IntVar(&prometheusPort, "prometheus-port", 0, "If set to anything but 0, signifies the port on which to run the prometheus exporter")
+	flag.StringVar(&observabilityOptions, "observability", "", "If set, turn distributed tracing and monitoring with OpenCensus\n"+
+		"Of the form:\n\t<samplerRate>;<exporter>:<exporter_option>:<exporter_option2>\nFor example:\n\t0.01;aws-xray,stackdriver:tracing=true:monitorining=true,prometheus:port=9987")
 
 	caddy.RegisterCaddyfileLoader("flag", caddy.LoaderFunc(confLoader))
 	caddy.SetDefaultCaddyfileLoader("default", caddy.LoaderFunc(defaultLoader))
@@ -74,8 +74,6 @@ func Run() {
 	caddy.AppName = appName
 	caddy.AppVersion = appVersion
 	acme.UserAgent = appName + "/" + appVersion
-
-	createOpenCensusExporters(traceSamplerRate, prometheusPort)
 
 	// Set up process log before anything bad happens
 	switch logfile {
@@ -102,6 +100,10 @@ func Run() {
 		}
 	} else if disabledMetrics != "" {
 		mustLogFatalf("[ERROR] Cannot disable specific metrics because telemetry is disabled")
+	}
+
+	if err := createObservabilityExporters(observabilityOptions); err != nil {
+		mustLogFatalf("[ERROR] Initializing observability: %v", err)
 	}
 
 	// Check for one-time actions
@@ -424,8 +426,7 @@ var (
 	validate        bool
 	disabledMetrics string
 
-	traceSamplerRate float64
-	prometheusPort   int
+	observabilityOptions string
 )
 
 // Build information obtained with the help of -ldflags

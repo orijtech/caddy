@@ -33,12 +33,18 @@ import (
 	"log"
 	"net/http"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	// Distributed tracing and monitoring imports
 	xray "github.com/census-instrumentation/opencensus-go-exporter-aws"
+	openzipkin "github.com/openzipkin/zipkin-go"
+	zipkinHTTP "github.com/openzipkin/zipkin-go/reporter/http"
+	"go.opencensus.io/exporter/jaeger"
 	"go.opencensus.io/exporter/prometheus"
 	"go.opencensus.io/exporter/stackdriver"
+	"go.opencensus.io/exporter/zipkin"
 	"go.opencensus.io/plugin/ochttp"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
@@ -103,72 +109,304 @@ func (rm *runtimeMetrics) cycle(cancel chan bool) {
 	}
 }
 
-func createOpenCensusExporters(sampleRate float64, prometheusPort int) {
-	var defaultSampler trace.Sampler
-	var skipExporters bool
-	switch {
-	case sampleRate <= 0.0:
-		defaultSampler = trace.NeverSample()
-		// If the rate is <= 0.0, in this case the user absolutely
-		// doesn't want any exporters nor metrics.
-		skipExporters = true
-	case sampleRate >= 1.0:
-		defaultSampler = trace.AlwaysSample()
-	default:
-		defaultSampler = trace.ProbabilitySampler(sampleRate)
+func createObservabilityExporters(observabilityOptions string) error {
+	observabilityOptions = strings.TrimSpace(observabilityOptions)
+	if observabilityOptions == "" {
+		// Nothing to do
+		return nil
 	}
+
+	exportsConfig := observabilityOptions
+	var sampleRate = -1.0
+	if sampleRateDelimCount := strings.Count(observabilityOptions, ";"); sampleRateDelimCount > 0 {
+		if sampleRateDelimCount != 1 {
+			return fmt.Errorf(`Expecting only one single delimiter ";" got %d in %q`, sampleRateDelimCount, observabilityOptions)
+		}
+
+		// In this case we've got: <sampleRate>;<exporter>[:exporter_options...]
+		splits := strings.Split(observabilityOptions, ";")
+		rateStr := splits[0]
+		rate, err := strconv.ParseFloat(rateStr, 64)
+		if err != nil {
+			return fmt.Errorf("Failed to parse a float out of %q got error %v", observabilityOptions, err)
+		}
+		sampleRate = rate
+		exportsConfig = splits[1]
+	}
+
+	defaultSampler, skipExporters := extractSampler(sampleRate)
 	trace.ApplyConfig(trace.Config{DefaultSampler: defaultSampler})
 
 	if skipExporters {
-		return
+		return nil
+	}
+
+	if err := createExporters(exportsConfig); err != nil {
+		return err
 	}
 
 	if err := view.Register(ochttp.DefaultServerViews...); err != nil {
-		log.Fatalf("Failed to register ochttp.DefaultServerViews: %v", err)
+		return fmt.Errorf("Failed to register ochttp.DefaultServerViews: %v", err)
 	}
 	if err := view.Register(ochttp.DefaultClientViews...); err != nil {
-		log.Fatalf("Failed to register ochttp.DefaultClientViews: %v", err)
+		return fmt.Errorf("Failed to register ochttp.DefaultClientViews: %v", err)
 	}
 
 	// Collecting runtime stats
 	rmc := new(runtimeMetrics)
 	if err := view.Register(memStatsViews...); err != nil {
-		log.Fatalf("Failed to register memory statistics views: %v", err)
+		return fmt.Errorf("Failed to register memory statistics views: %v", err)
 	}
 	go rmc.cycle(nil)
 
+	return nil
+}
+
+func extractSampler(sampleRate float64) (sampler trace.Sampler, skipExporters bool) {
+	switch {
+	case sampleRate <= 0.0:
+		sampler = trace.NeverSample()
+		// If the rate is <= 0.0, in this case the user absolutely
+		// doesn't want any exporters nor metrics.
+		skipExporters = true
+	case sampleRate >= 1.0:
+		sampler = trace.AlwaysSample()
+	default:
+		sampler = trace.ProbabilitySampler(sampleRate)
+	}
+	return sampler, skipExporters
+}
+
+func createExporters(exportersConfig string) error {
+	exportersConfig = strings.TrimSpace(exportersConfig)
+	if exportersConfig == "" {
+		return nil
+	}
+
+	// Sample content:
+	//  "prometheus:port=8978,stackdriver:tracing=true:monitoring=true:metrics-prefix=foo_bar,aws-xray,zipkin"
+	// which is then split into
+	//  ["prometheus:port=8978", "stackdriver:tracing=true:monitoring=true:metrics-prefix=foo_bar", "aws-xray", "zipkin"]
+	exporterConfigsSplits := strings.Split(exportersConfig, ",")
+
+	for _, exporterConfig := range exporterConfigsSplits {
+		nameConfigSplits := strings.Split(exporterConfig, ":")
+		name := strings.ToLower(nameConfigSplits[0])
+		var keyValues []string
+		if len(nameConfigSplits) > 1 {
+			keyValues = nameConfigSplits[1:]
+		}
+
+		switch name {
+		case "aws-xray":
+			if err := parseAndRegisterAWSXRayExporter(keyValues); err != nil {
+				return fmt.Errorf("AWS X-Ray exporter: %v", err)
+			}
+
+		case "prometheus":
+			if err := parseAndRegisterPrometheusExporter(keyValues); err != nil {
+				return fmt.Errorf("Prometheus exporter: %v", err)
+			}
+
+		case "stackdriver":
+			if err := parseAndRegisterStackdriverExporter(keyValues); err != nil {
+				return fmt.Errorf("Stackdriver exporter: %v", err)
+			}
+
+		case "zipkin":
+			if err := parseAndRegisterZipkinExporter(keyValues); err != nil {
+				return fmt.Errorf("Zipkin exporter: %v", err)
+			}
+
+		case "jaeger":
+			if err := parseAndRegisterJaegerExporter(keyValues); err != nil {
+				return fmt.Errorf("Jaeger exporter: %v", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+const defaultMetricsNamespace = "caddyserver"
+
+func parseAndRegisterPrometheusExporter(keyValues []string) error {
+	namespace := defaultMetricsNamespace
+	portStr := "9999"
+
+	for _, kv := range keyValues {
+		kvSplit := strings.Split(kv, "=")
+
+		switch strings.ToLower(kvSplit[0]) {
+		case "port":
+			if len(kvSplit) > 1 {
+				portStr = kvSplit[1]
+			}
+
+		case "namespace":
+			if len(kvSplit) > 1 {
+				namespace = kvSplit[1]
+			}
+
+		default:
+			// TODO: Add other Prometheus configuration key-value pairs here.
+		}
+	}
+
+	port, err := strconv.ParseUint(portStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("Failed to parse port from Prometheus configuration from configuration %q: %v", portStr, err)
+	}
+
+	pe, err := prometheus.NewExporter(prometheus.Options{Namespace: namespace})
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", pe)
+		addr := fmt.Sprintf(":%d", port)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Fatalf("Failed to serve Prometheus endpoint: %v", err)
+		}
+	}()
+
+	view.RegisterExporter(pe)
+	log.Printf("Successfully registered Prometheus exporter")
+
+	return nil
+}
+
+func parseAndRegisterAWSXRayExporter(keyValues []string) error {
 	xe, err := xray.NewExporter(xray.WithVersion("latest"))
 	if err != nil {
-		log.Fatalf("Failed to create AWS X-Ray exporter: %v", err)
+		return err
 	}
+
 	trace.RegisterExporter(xe)
+	log.Printf("Successfully register AWS X-Ray exporter")
+
+	return nil
+}
+
+func parseAndRegisterStackdriverExporter(keyValues []string) error {
+	metricsPrefix := defaultMetricsNamespace
+	monitoring := false
+	tracing := false
+	projectID := ""
+
+	for _, keyValue := range keyValues {
+		kvSplit := strings.Split(keyValue, "=")
+
+		switch strings.ToLower(kvSplit[0]) {
+		case "tracing":
+			tracing = len(kvSplit) > 1 && (kvSplit[1] == "1" || strings.ToLower(kvSplit[1]) == "true")
+		case "monitoring":
+			monitoring = len(kvSplit) > 1 && (kvSplit[1] == "1" || strings.ToLower(kvSplit[1]) == "true")
+		case "metrics-prefix":
+			if len(kvSplit) > 1 {
+				metricsPrefix = kvSplit[1]
+			}
+		case "project-id":
+			if len(kvSplit) > 1 {
+				projectID = kvSplit[1]
+			}
+		}
+	}
 
 	se, err := stackdriver.NewExporter(stackdriver.Options{
-		ProjectID:    "census-demos",
-		MetricPrefix: "caddyserver",
+		ProjectID:    projectID,
+		MetricPrefix: metricsPrefix,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create Stackdriver exporter: %v", err)
 	}
-	trace.RegisterExporter(se)
-	view.RegisterExporter(se)
 
-	if prometheusPort > 0 {
-		pe, err := prometheus.NewExporter(prometheus.Options{
-			Namespace: "caddyserver",
-		})
-		if err != nil {
-			log.Fatalf("Failed to create Prometheus exporter: %v", err)
-		}
-		view.RegisterExporter(pe)
-		go func() {
-			mux := http.NewServeMux()
-			mux.Handle("/metrics", pe)
-			addr := fmt.Sprintf(":%d", prometheusPort)
-			if err := http.ListenAndServe(addr, mux); err != nil {
-				log.Fatalf("Failed to serve Prometheus endpoint: %v", err)
-			}
-		}()
+	if tracing {
+		trace.RegisterExporter(se)
+		log.Printf("Successfully register Stackdriver Trace exporter")
+	}
+	if monitoring {
+		view.RegisterExporter(se)
+		log.Printf("Successfully register Stackdriver Monitoring exporter")
 	}
 
+	return nil
+}
+
+func parseAndRegisterZipkinExporter(keyValues []string) error {
+	localEndpointURI := "192.168.1.5:5454"
+	reporterURI := "http://localhost:9411/api/v2/spans"
+	serviceName := "server"
+
+	for _, keyValue := range keyValues {
+		kvSplit := strings.Split(keyValue, "=")
+
+		switch strings.ToLower(kvSplit[0]) {
+		case "local":
+			if len(kvSplit) > 0 {
+				localEndpointURI = kvSplit[1]
+			}
+		case "reporter":
+			if len(kvSplit) > 0 {
+				reporterURI = kvSplit[1]
+			}
+		case "service-name":
+			if len(kvSplit) > 1 {
+				serviceName = kvSplit[1]
+			}
+		}
+	}
+
+	localEndpoint, err := openzipkin.NewEndpoint(serviceName, localEndpointURI)
+	if err != nil {
+		log.Fatalf("Failed to create Zipkin localEndpoint with URI %q error: %v", localEndpointURI, err)
+	}
+
+	reporter := zipkinHTTP.NewReporter(reporterURI)
+	ze := zipkin.NewExporter(reporter, localEndpoint)
+	trace.RegisterExporter(ze)
+	log.Printf("Successfully registered Zipkin exporter")
+
+	return nil
+}
+
+func parseAndRegisterJaegerExporter(keyValues []string) error {
+	agentEndpointURI := "localhost:6831"
+	collectorEndpointURI := "http://localhost:9411"
+	serviceName := defaultMetricsNamespace
+
+	for _, kv := range keyValues {
+		kvSplit := strings.Split(kv, "=")
+
+		switch strings.ToLower(kvSplit[0]) {
+		case "collector":
+			if len(kvSplit) > 0 {
+				collectorEndpointURI = kvSplit[1]
+			}
+		case "agent":
+			if len(kvSplit) > 0 {
+				agentEndpointURI = kvSplit[1]
+			}
+		case "service-name":
+			if len(kvSplit) > 1 {
+				serviceName = kvSplit[1]
+			}
+		}
+	}
+
+	je, err := jaeger.NewExporter(jaeger.Options{
+		AgentEndpoint: agentEndpointURI,
+		Endpoint:      collectorEndpointURI,
+		ServiceName:   serviceName,
+	})
+	if err != nil {
+		return err
+	}
+
+	trace.RegisterExporter(je)
+	log.Printf("Successfully registered Jaeger exporter")
+
+	return nil
 }

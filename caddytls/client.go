@@ -15,6 +15,7 @@
 package caddytls
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,10 @@ import (
 	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/telemetry"
 	"github.com/xenolf/lego/acmev2"
+
+	"go.opencensus.io/stats"
+	"go.opencensus.io/tag"
+	"go.opencensus.io/trace"
 )
 
 // acmeMu ensures that only one ACME challenge occurs at a time.
@@ -223,8 +228,22 @@ var newACMEClient = func(config *Config, allowPrompts bool) (*ACMEClient, error)
 // Callers who have access to a Config value should use the ObtainCert
 // method on that instead of this lower-level method.
 func (c *ACMEClient) Obtain(name string) error {
+	ctx, _ := tag.New(context.Background(), tag.Upsert(tagCertName, name))
+	measures := []stats.Measurement{mObtainCalls.M(1)}
+
+	ctx, span := trace.StartSpan(ctx, "caddytls.(*ACMEClient).Obtain")
+	span.Annotate([]trace.Attribute{
+		trace.StringAttribute("name", name),
+	}, "Obtaining certificate")
+
+	defer func() {
+		stats.Record(ctx, measures...)
+		span.End()
+	}()
+
 	waiter, err := c.storage.TryLock(name)
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 		return err
 	}
 	if waiter != nil {
@@ -239,14 +258,25 @@ func (c *ACMEClient) Obtain(name string) error {
 	}()
 
 	for attempts := 0; attempts < 2; attempts++ {
+		span.Annotate([]trace.Attribute{
+			trace.Int64Attribute("attempt", int64(attempts+1)),
+		}, "Attempting to obtain certificate")
+
 		namesObtaining.Add([]string{name})
 		acmeMu.Lock()
 		certificate, err := c.acmeClient.ObtainCertificate([]string{name}, true, nil, c.config.MustStaple)
 		acmeMu.Unlock()
 		namesObtaining.Remove([]string{name})
 		if err != nil {
+			measures = append(measures, mObtainFailures.M(1))
+			span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
+
 			// for a certain kind of error, we can enumerate the error per-domain
 			if failures, ok := err.(acme.ObtainError); ok && len(failures) > 0 {
+				span.Annotate([]trace.Attribute{
+					trace.Int64Attribute("failures", int64(len(failures))),
+				}, "Obtain error failures")
+
 				var errMsg string // combine all the failures into a single error message
 				for errDomain, obtainErr := range failures {
 					if obtainErr == nil {
@@ -262,18 +292,29 @@ func (c *ACMEClient) Obtain(name string) error {
 
 		// double-check that we actually got a certificate, in case there's a bug upstream (see issue #2121)
 		if certificate.Domain == "" || certificate.Certificate == nil {
+			span.SetStatus(trace.Status{
+				Code:    int32(trace.StatusCodeInternal),
+				Message: "Blank domain or nil Certificate, potential bug",
+			})
+			measures = append(measures, mObtainBlankCertificates.M(1))
 			return errors.New("returned certificate was empty; probably an unchecked error obtaining it")
 		}
 
 		// Success - immediately save the certificate resource
 		err = saveCertResource(c.storage, certificate)
 		if err != nil {
+			span.SetStatus(trace.Status{
+				Code:    int32(trace.StatusCodeInternal),
+				Message: err.Error(),
+			})
+			measures = append(measures, mSaveCertErrors.M(1))
 			return fmt.Errorf("error saving assets for %v: %v", name, err)
 		}
 
 		break
 	}
 
+	measures = append(measures, mObtainSuccesses.M(1))
 	go telemetry.Increment("tls_acme_certs_obtained")
 
 	return nil
@@ -286,6 +327,19 @@ func (c *ACMEClient) Obtain(name string) error {
 // Callers who have access to a Config value should use the RenewCert
 // method on that instead of this lower-level method.
 func (c *ACMEClient) Renew(name string) error {
+	ctx, _ := tag.New(context.Background(), tag.Upsert(tagCertName, name))
+	measures := []stats.Measurement{mRenewCalls.M(1)}
+
+	ctx, span := trace.StartSpan(ctx, "caddytls.(*ACMEClient).Renew")
+	span.Annotate([]trace.Attribute{
+		trace.StringAttribute("name", name),
+	}, "Renewing certificate")
+
+	defer func() {
+		stats.Record(ctx, measures...)
+		span.End()
+	}()
+
 	waiter, err := c.storage.TryLock(name)
 	if err != nil {
 		return err
@@ -304,6 +358,8 @@ func (c *ACMEClient) Renew(name string) error {
 	// Prepare for renewal (load PEM cert, key, and meta)
 	siteData, err := c.storage.LoadSite(name)
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
+		measures = append(measures, mSiteLoadErrors.M(1))
 		return err
 	}
 	var certMeta acme.CertificateResource
@@ -315,6 +371,10 @@ func (c *ACMEClient) Renew(name string) error {
 	var newCertMeta acme.CertificateResource
 	var success bool
 	for attempts := 0; attempts < 2; attempts++ {
+		span.Annotate([]trace.Attribute{
+			trace.Int64Attribute("attempt", int64(attempts+1)),
+		}, "Attempting to renew certificate")
+
 		namesObtaining.Add([]string{name})
 		acmeMu.Lock()
 		newCertMeta, err = c.acmeClient.RenewCertificate(certMeta, true, c.config.MustStaple)
@@ -325,6 +385,11 @@ func (c *ACMEClient) Renew(name string) error {
 			// TODO: This is a temporary workaround for what I think is a bug in the acmev2 package (March 2018)
 			// but it might not hurt to keep this extra check in place
 			if newCertMeta.Domain == "" || newCertMeta.Certificate == nil {
+				span.SetStatus(trace.Status{
+					Code:    int32(trace.StatusCodeInternal),
+					Message: "Blank domain or nil Certificate, potential bug",
+				})
+				measures = append(measures, mObtainBlankCertificates.M(1))
 				err = errors.New("returned certificate was empty; probably an unchecked error renewing it")
 			} else {
 				success = true
@@ -339,11 +404,13 @@ func (c *ACMEClient) Renew(name string) error {
 	}
 
 	if !success {
+		measures = append(measures, mRenewFailures.M(1))
 		return errors.New("too many renewal attempts; last error: " + err.Error())
 	}
 
 	caddy.EmitEvent(caddy.CertRenewEvent, name)
 	go telemetry.Increment("tls_acme_certs_renewed")
+	measures = append(measures, mRenewSuccesses.M(1))
 
 	return saveCertResource(c.storage, newCertMeta)
 }
@@ -351,29 +418,53 @@ func (c *ACMEClient) Renew(name string) error {
 // Revoke revokes the certificate for name and deletes
 // it from storage.
 func (c *ACMEClient) Revoke(name string) error {
+	ctx, _ := tag.New(context.Background(), tag.Upsert(tagCertName, name))
+	measures := []stats.Measurement{mRevokeCalls.M(1)}
+
+	ctx, span := trace.StartSpan(ctx, "caddytls.(*ACMEClient).Revoke")
+	span.Annotate([]trace.Attribute{
+		trace.StringAttribute("name", name),
+	}, "Revoking certificate")
+
+	defer func() {
+		stats.Record(ctx, measures...)
+		span.End()
+	}()
+
 	siteExists, err := c.storage.SiteExists(name)
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
+		measures = append(measures, mSiteExistsErrors.M(1))
 		return err
 	}
 
 	if !siteExists {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeNotFound), Message: "No such site exists in storage"})
+		measures = append(measures, mSiteNotExistsErrors.M(1))
 		return errors.New("no certificate and key for " + name)
 	}
 
 	siteData, err := c.storage.LoadSite(name)
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
+		measures = append(measures, mSiteLoadErrors.M(1))
 		return err
 	}
 
 	err = c.acmeClient.RevokeCertificate(siteData.Cert)
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
+		measures = append(measures, mRevokeFailures.M(1))
 		return err
 	}
 
+	measures = append(measures, mRevokeSuccesses.M(1))
 	go telemetry.Increment("tls_acme_certs_revoked")
 
 	err = c.storage.DeleteSite(name)
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
+		measures = append(measures, mFailedCertFileDeletions.M(1))
 		return errors.New("certificate revoked, but unable to delete certificate file: " + err.Error())
 	}
 
