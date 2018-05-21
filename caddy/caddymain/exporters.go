@@ -109,6 +109,10 @@ func (rm *runtimeMetrics) cycle(cancel chan bool) {
 	}
 }
 
+func observabilityLogf(fmt_ string, args ...interface{}) {
+	log.Printf("[observability] %s", fmt.Sprintf(fmt_, args...))
+}
+
 func createObservabilityExporters(observabilityOptions string) error {
 	observabilityOptions = strings.TrimSpace(observabilityOptions)
 	if observabilityOptions == "" {
@@ -134,6 +138,7 @@ func createObservabilityExporters(observabilityOptions string) error {
 		exportsConfig = splits[1]
 	}
 
+	observabilityLogf("SampleRate: %.3f\n", sampleRate)
 	defaultSampler, skipExporters := extractSampler(sampleRate)
 	trace.ApplyConfig(trace.Config{DefaultSampler: defaultSampler})
 
@@ -154,6 +159,7 @@ func createObservabilityExporters(observabilityOptions string) error {
 
 	// Collecting runtime stats
 	rmc := new(runtimeMetrics)
+	observabilityLogf("Registering runtimeMetrics")
 	if err := view.Register(memStatsViews...); err != nil {
 		return fmt.Errorf("Failed to register memory statistics views: %v", err)
 	}
@@ -273,7 +279,7 @@ func parseAndRegisterPrometheusExporter(keyValues []string) error {
 	}()
 
 	view.RegisterExporter(pe)
-	log.Printf("Successfully registered Prometheus exporter")
+	observabilityLogf("Successfully registered Prometheus exporter\n")
 
 	return nil
 }
@@ -285,7 +291,7 @@ func parseAndRegisterAWSXRayExporter(keyValues []string) error {
 	}
 
 	trace.RegisterExporter(xe)
-	log.Printf("Successfully register AWS X-Ray exporter")
+	observabilityLogf("Successfully register AWS X-Ray exporter\n")
 
 	return nil
 }
@@ -325,11 +331,11 @@ func parseAndRegisterStackdriverExporter(keyValues []string) error {
 
 	if tracing {
 		trace.RegisterExporter(se)
-		log.Printf("Successfully register Stackdriver Trace exporter")
+		observabilityLogf("Successfully register Stackdriver Trace exporter\n")
 	}
 	if monitoring {
 		view.RegisterExporter(se)
-		log.Printf("Successfully register Stackdriver Monitoring exporter")
+		observabilityLogf("Successfully register Stackdriver Monitoring exporter\n")
 	}
 
 	return nil
