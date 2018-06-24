@@ -342,7 +342,7 @@ func (b Browse) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 		switch {
 		case os.IsPermission(err):
 			return http.StatusForbidden, err
-		case os.IsExist(err):
+		case os.IsNotExist(err):
 			return http.StatusNotFound, err
 		default:
 			return b.Next.ServeHTTP(w, r)

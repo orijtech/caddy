@@ -17,6 +17,7 @@ package browse
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -621,5 +622,56 @@ func TestDirSymlink(t *testing.T) {
 				t.Errorf("Test %d - failed, could not find name %v", i, tc.expectedName)
 			}
 		}()
+	}
+}
+
+func TestBrowseConfigMismatch(t *testing.T) {
+    t.Skipf("Skipping")
+	tmpdir, err := ioutil.TempDir("", "check_servehttp_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tmpdir)
+
+	existentPath := "existent"
+	if err := os.MkdirAll(filepath.Join(tmpdir, existentPath), 0755); err != nil {
+		t.Fatalf("Failed to create sub temp directory as control: %v", err)
+	}
+	gameOverHandler := func(w http.ResponseWriter, r *http.Request) (int, error) {
+		return 500, errors.New("game over, this next handler got invoked")
+	}
+	fs := http.Dir(tmpdir)
+	brw := &Browse{
+		Next: httpserver.HandlerFunc(gameOverHandler),
+		Configs: []Config{
+			{Fs: staticfiles.FileServer{Root: fs}, Template: template.Must(template.New("test").Parse("{{.Name}}"))},
+		},
+	}
+
+	tests := []struct {
+		path     string
+		wantCode int
+		wantErr  string
+	}{
+		{path: "/" + existentPath + "/", wantCode: http.StatusOK},
+		{path: "/nonexistent", wantCode: http.StatusNotFound, wantErr: "no such file or directory"},
+	}
+
+	for i, tt := range tests {
+		rw := httptest.NewRecorder()
+		req := &http.Request{URL: &url.URL{Path: tt.path}, Method: "GET"}
+
+		code, err := brw.ServeHTTP(rw, req)
+		if err != nil {
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("#%d:\nError\n\t%q\nWant\n\t%s", i, err, tt.wantErr)
+			}
+		} else if tt.wantErr != "" {
+			t.Errorf("#%d: want error to contain %q", i, tt.wantErr)
+		}
+
+		if code != tt.wantCode {
+			t.Errorf("#%d: Code %d want %d", i, code, tt.wantCode)
+		}
 	}
 }

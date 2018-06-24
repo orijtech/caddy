@@ -365,7 +365,7 @@ func TestLogParse(t *testing.T) {
 
 			for k, actualEntry := range actualLogRule.Entries {
 				if !reflect.DeepEqual(actualEntry.Log, test.expectedLogRules[j].Entries[k].Log) {
-					t.Errorf("Test %d expected %dth LogRule Log to be  %v  , but got %v",
+					t.Errorf("Test %d expected %dth LogRule Log to be\n%#v\nbut got\n%#v",
 						i, j, test.expectedLogRules[j].Entries[k].Log, actualEntry.Log)
 				}
 
